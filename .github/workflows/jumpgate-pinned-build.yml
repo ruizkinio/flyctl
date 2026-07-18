@@ -1,0 +1,103 @@
+name: Jumpgate pinned flyctl build
+
+on:
+  push:
+    tags:
+      - jumpgate-flyctl-v0.4.69-digest1
+
+permissions: {}
+
+jobs:
+  build:
+    name: Test, build, attest, and release Linux amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    env:
+      FIX_COMMIT: 19749aa6b6381a3a0597c0c2fb74bf8504b34884
+      RELEASE_TAG: jumpgate-flyctl-v0.4.69-digest1
+      RELEASE_VERSION: 0.4.69-jumpgate-digest1
+    steps:
+      - name: Check out the tagged fork source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Set up the exact Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          cache: true
+          go-version-file: go.mod
+      - name: Verify the immutable release lineage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_TYPE" = "tag"
+          test "$GITHUB_REF_NAME" = "$RELEASE_TAG"
+          test "$(git rev-parse HEAD^)" = "$FIX_COMMIT"
+          test "$(git describe --exact-match --tags HEAD)" = "$RELEASE_TAG"
+          test "$(go version | awk '{print $3}')" = "go1.26.1"
+      - name: Run the complete fork test suite
+        run: go test ./... -count=1
+      - name: Vet the affected packages
+        run: go vet ./internal/build/imgsrc ./internal/command/deploy
+      - name: Build a deterministic production binary
+        id: artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_date="$(git show -s --format=%cI HEAD)"
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          commit="$(git rev-parse HEAD)"
+          archive_name="flyctl_${RELEASE_VERSION}_Linux_x86_64.tar.gz"
+          mkdir -p dist/stage
+          ldflags="-s -w -buildid= -X github.com/superfly/flyctl/internal/buildinfo.buildDate=$build_date -X github.com/superfly/flyctl/internal/buildinfo.buildVersion=$RELEASE_VERSION"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -buildvcs=true -tags production \
+            -ldflags "$ldflags" -o dist/stage/flyctl .
+          chmod 0755 dist/stage/flyctl
+          version_output="$(dist/stage/flyctl version 2>&1)"
+          grep -F "flyctl v${RELEASE_VERSION} linux/amd64 Commit: ${commit} BuildDate: ${build_date}" \
+            <<<"$version_output"
+          tar --sort=name --mtime="@${source_date_epoch}" --owner=0 --group=0 \
+            --numeric-owner --mode='u+rwX,go+rX,go-w' -C dist/stage -cf - flyctl |
+            gzip -n > "dist/$archive_name"
+          (
+            cd dist
+            sha256sum "$archive_name" > "$archive_name.sha256"
+          )
+          test "$(wc -l < "dist/$archive_name.sha256")" -eq 1
+          {
+            echo "archive=dist/$archive_name"
+            echo "checksum=dist/$archive_name.sha256"
+          } >> "$GITHUB_OUTPUT"
+      - name: Attest the immutable archive
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: ${{ steps.artifact.outputs.archive }}
+      - name: Publish the pinned fork release
+        env:
+          ARCHIVE: ${{ steps.artifact.outputs.archive }}
+          CHECKSUM: ${{ steps.artifact.outputs.checksum }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Jumpgate's narrowly patched flyctl v0.4.69 build.
+
+          - Upstream base: superfly/flyctl v0.4.69 (324951dd0286e1ff34dbceeb54ef8c4dc09c1668)
+          - Digest-preservation fix: $FIX_COMMIT
+          - Tagged source: $GITHUB_SHA
+          - Scope: preserve the resolved tag@sha256 reference for release-command and app Machines
+
+          Verify the archive with the attached SHA-256 file and GitHub artifact attestation.
+          EOF
+          gh release create "$RELEASE_TAG" "$ARCHIVE" "$CHECKSUM" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Jumpgate flyctl v0.4.69 digest1" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --verify-tag
