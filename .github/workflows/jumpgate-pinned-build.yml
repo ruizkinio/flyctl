@@ -1,0 +1,470 @@
+name: Jumpgate pinned flyctl build
+
+on:
+  push:
+    tags:
+      - jumpgate-flyctl-v0.4.69-digest2
+
+permissions: {}
+
+concurrency:
+  group: jumpgate-flyctl-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ASSET_NAME: flyctl_0.4.69-jumpgate-digest2_Linux_x86_64.tar.gz
+  FIX_COMMIT: 19749aa6b6381a3a0597c0c2fb74bf8504b34884
+  GO_VERSION: 1.26.1
+  GOTOOLCHAIN: local
+  METADATA_NAME: release-metadata.json
+  RELEASE_TAG: jumpgate-flyctl-v0.4.69-digest2
+  RELEASE_TITLE: Jumpgate flyctl v0.4.69 digest2
+  RELEASE_VERSION: 0.4.69-jumpgate-digest2
+
+jobs:
+  test:
+    name: Test the exact release source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the tagged fork source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 2
+          fetch-tags: true
+          persist-credentials: false
+      - name: Set up the exact local Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          cache: false
+          check-latest: false
+          go-version: ${{ env.GO_VERSION }}
+      - name: Verify exact source lineage and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_TYPE" = "tag"
+          test "$GITHUB_REF_NAME" = "$RELEASE_TAG"
+          test "$(git describe --exact-match --tags HEAD)" = "$RELEASE_TAG"
+          test "$(git cat-file -t "$RELEASE_TAG")" = "tag"
+          test "$(git rev-parse "$RELEASE_TAG^{}")" = "$GITHUB_SHA"
+          parents="$(git rev-list --parents -n 1 HEAD)"
+          test "$(wc -w <<<"$parents")" -eq 2
+          test "$(awk '{print $2}' <<<"$parents")" = "$FIX_COMMIT"
+          test "$(git diff --name-status "$FIX_COMMIT" HEAD)" = \
+            $'A\t.github/workflows/jumpgate-pinned-build.yml'
+          test "$(go version | awk '{print $3}')" = "go${GO_VERSION}"
+          test "$(go env GOTOOLCHAIN)" = "local"
+          grep -Fx "go $GO_VERSION" go.mod
+      - name: Download and verify locked modules
+        run: |
+          go mod download
+          go mod verify
+      - name: Run the complete fork test suite
+        run: go test ./... -count=1
+      - name: Vet the complete fork
+        run: go vet ./...
+      - name: Prove tests left the source immutable
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+  build:
+    name: Reproducible Linux amd64 build ${{ matrix.replica }}
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        replica:
+          - a
+          - b
+    steps:
+      - name: Check out the tagged fork source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 2
+          fetch-tags: true
+          persist-credentials: false
+      - name: Set up the exact local Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          cache: false
+          check-latest: false
+          go-version: ${{ env.GO_VERSION }}
+      - name: Reverify source, modules, and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          parents="$(git rev-list --parents -n 1 HEAD)"
+          test "$(wc -w <<<"$parents")" -eq 2
+          test "$(awk '{print $2}' <<<"$parents")" = "$FIX_COMMIT"
+          test "$(git diff --name-status "$FIX_COMMIT" HEAD)" = \
+            $'A\t.github/workflows/jumpgate-pinned-build.yml'
+          test "$(go version | awk '{print $3}')" = "go${GO_VERSION}"
+          test "$(go env GOTOOLCHAIN)" = "local"
+          go mod download
+          go mod verify
+          git diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - name: Build and package the immutable binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_date="$(git show -s --format=%cI HEAD)"
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          output="$RUNNER_TEMP/release-assets"
+          stage="$RUNNER_TEMP/stage"
+          mkdir -p "$output" "$stage"
+          ldflags="-s -w -buildid= -X github.com/superfly/flyctl/internal/buildinfo.buildDate=$build_date -X github.com/superfly/flyctl/internal/buildinfo.buildVersion=$RELEASE_VERSION"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -buildvcs=true -tags production \
+            -ldflags "$ldflags" -o "$stage/flyctl" .
+          chmod 0755 "$stage/flyctl"
+          version_output="$("$stage/flyctl" version 2>&1)"
+          grep -F "flyctl v${RELEASE_VERSION} linux/amd64 Commit: ${GITHUB_SHA} BuildDate: ${build_date}" \
+            <<<"$version_output"
+          tar --sort=name --mtime="@${source_date_epoch}" --owner=0 --group=0 \
+            --numeric-owner --mode='u+rwX,go+rX,go-w' -C "$stage" -cf - flyctl |
+            gzip -n > "$output/$ASSET_NAME"
+          sha256="$(sha256sum "$output/$ASSET_NAME" | awk '{print $1}')"
+          printf '%s  %s\n' "$sha256" "$ASSET_NAME" > "$output/$ASSET_NAME.sha256"
+          jq -n \
+            --arg asset "$ASSET_NAME" \
+            --arg buildDate "$build_date" \
+            --arg fixCommit "$FIX_COMMIT" \
+            --arg goVersion "$GO_VERSION" \
+            --arg releaseTag "$RELEASE_TAG" \
+            --arg releaseVersion "$RELEASE_VERSION" \
+            --arg sha256 "$sha256" \
+            --arg sourceCommit "$GITHUB_SHA" \
+            '{asset:$asset,buildDate:$buildDate,fixCommit:$fixCommit,goVersion:$goVersion,releaseTag:$releaseTag,releaseVersion:$releaseVersion,sha256:$sha256,sourceCommit:$sourceCommit}' \
+            > "$output/$METADATA_NAME"
+          test "$(tar -tzf "$output/$ASSET_NAME")" = "flyctl"
+          (
+            cd "$output"
+            sha256sum --check --strict "$ASSET_NAME.sha256"
+          )
+          git diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - name: Upload the independently built archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          compression-level: 0
+          if-no-files-found: error
+          name: jumpgate-flyctl-digest2-${{ matrix.replica }}-${{ github.sha }}
+          path: ${{ runner.temp }}/release-assets/*
+          retention-days: 1
+
+  publish:
+    name: Verify, attest, and publish
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: jumpgate-flyctl-release
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    env:
+      EXPECTED_SOURCE_SHA: ${{ vars.EXPECTED_SOURCE_SHA }}
+      EXPECTED_TAG_OID: ${{ vars.EXPECTED_TAG_OID }}
+    steps:
+      - name: Check out the exact tagged source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 2
+          fetch-tags: true
+          persist-credentials: false
+      - name: Download build replica a
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: jumpgate-flyctl-digest2-a-${{ github.sha }}
+          path: ${{ runner.temp }}/replica-a
+      - name: Download build replica b
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: jumpgate-flyctl-digest2-b-${{ github.sha }}
+          path: ${{ runner.temp }}/replica-b
+      - name: Verify protected source, tag, and reproducibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_SOURCE_SHA"
+          test "$GITHUB_SHA" = "$EXPECTED_SOURCE_SHA"
+          parents="$(git rev-list --parents -n 1 HEAD)"
+          test "$(wc -w <<<"$parents")" -eq 2
+          test "$(awk '{print $2}' <<<"$parents")" = "$FIX_COMMIT"
+          test "$(git diff --name-status "$FIX_COMMIT" HEAD)" = \
+            $'A\t.github/workflows/jumpgate-pinned-build.yml'
+          test "$(git cat-file -t "$RELEASE_TAG")" = "tag"
+          local_tag_oid="$(git rev-parse "$RELEASE_TAG")"
+          test -n "$EXPECTED_TAG_OID"
+          test "$local_tag_oid" = "$EXPECTED_TAG_OID"
+          test "$(git rev-parse "$RELEASE_TAG^{}")" = "$GITHUB_SHA"
+          mapfile -t remote_refs < <(
+            git ls-remote --tags origin \
+              "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}"
+          )
+          test "${#remote_refs[@]}" -eq 2
+          remote_tag_oid="$(printf '%s\n' "${remote_refs[@]}" |
+            awk '$2 !~ /\^\{\}$/ {print $1}')"
+          remote_peeled="$(printf '%s\n' "${remote_refs[@]}" |
+            awk '$2 ~ /\^\{\}$/ {print $1}')"
+          test -n "$remote_tag_oid"
+          test "$remote_tag_oid" = "$local_tag_oid"
+          test "$remote_peeled" = "$GITHUB_SHA"
+          build_date="$(git show -s --format=%cI HEAD)"
+          a="$RUNNER_TEMP/replica-a"
+          b="$RUNNER_TEMP/replica-b"
+          for dir in "$a" "$b"; do
+            test "$(find "$dir" -maxdepth 1 -type f | wc -l)" -eq 3
+            test "$(wc -l < "$dir/$ASSET_NAME.sha256")" -eq 1
+            (
+              cd "$dir"
+              sha256sum --check --strict "$ASSET_NAME.sha256"
+            )
+            jq -e \
+              --arg asset "$ASSET_NAME" \
+              --arg buildDate "$build_date" \
+              --arg fix "$FIX_COMMIT" \
+              --arg go "$GO_VERSION" \
+              --arg sha "$(awk '{print $1}' "$dir/$ASSET_NAME.sha256")" \
+              --arg source "$GITHUB_SHA" \
+              --arg tag "$RELEASE_TAG" \
+              --arg version "$RELEASE_VERSION" \
+              '.asset==$asset and .buildDate==$buildDate and .fixCommit==$fix and .goVersion==$go and .sha256==$sha and .sourceCommit==$source and .releaseTag==$tag and .releaseVersion==$version and (keys | sort) == (["asset","buildDate","fixCommit","goVersion","releaseTag","releaseVersion","sha256","sourceCommit"] | sort)' \
+              "$dir/$METADATA_NAME"
+            test "$(tar -tzf "$dir/$ASSET_NAME")" = "flyctl"
+          done
+          cmp "$a/$ASSET_NAME" "$b/$ASSET_NAME"
+          cmp "$a/$ASSET_NAME.sha256" "$b/$ASSET_NAME.sha256"
+          cmp "$a/$METADATA_NAME" "$b/$METADATA_NAME"
+          release_assets="$RUNNER_TEMP/release-assets"
+          mkdir -p "$release_assets"
+          cp "$a/$ASSET_NAME" "$a/$ASSET_NAME.sha256" "$a/$METADATA_NAME" \
+            "$release_assets/"
+          echo "RELEASE_ASSETS=$release_assets" >> "$GITHUB_ENV"
+      - name: Attest the byte-identical archive
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: ${{ runner.temp }}/release-assets/${{ env.ASSET_NAME }}
+      - name: Create, resume, or verify the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes" <<EOF
+          Jumpgate's digest-preserving flyctl v0.4.69 build.
+
+          - Upstream base: superfly/flyctl v0.4.69 (324951dd0286e1ff34dbceeb54ef8c4dc09c1668)
+          - Digest-preservation fix: $FIX_COMMIT
+          - Tagged source: $GITHUB_SHA
+          - Reproducibility: two isolated GitHub-hosted builds produced byte-identical archives
+
+          Verify the archive with the attached SHA-256 file and GitHub artifact attestation.
+          EOF
+          expected_body="$(cat "$notes")"
+          release_already_published=false
+          if existing="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets,body,isDraft,isPrerelease,name,tagName 2>/dev/null)"; then
+            actual_body="$(jq -r '.body // ""' <<<"$existing")"
+            test "$actual_body" = "$expected_body"
+            if jq -e \
+              --arg asset "$ASSET_NAME" \
+              --arg checksum "$ASSET_NAME.sha256" \
+              --arg metadata "$METADATA_NAME" \
+              --arg tag "$RELEASE_TAG" \
+              --arg title "$RELEASE_TITLE" \
+              '.isDraft == true and .isPrerelease == true and .tagName == $tag and .name == $title and ([.assets[].name] - [$asset, $checksum, $metadata] | length) == 0 and all(.assets[]; .state == "uploaded")' \
+              <<<"$existing"; then
+              :
+            elif jq -e \
+              --arg asset "$ASSET_NAME" \
+              --arg checksum "$ASSET_NAME.sha256" \
+              --arg metadata "$METADATA_NAME" \
+              --arg tag "$RELEASE_TAG" \
+              --arg title "$RELEASE_TITLE" \
+              '.isDraft == false and .isPrerelease == true and .tagName == $tag and .name == $title and (.assets | length) == 3 and ([.assets[].name] | sort) == ([$asset, $checksum, $metadata] | sort) and all(.assets[]; .state == "uploaded")' \
+              <<<"$existing"; then
+              release_already_published=true
+            else
+              echo "Existing release state or assets do not match the reviewed release" >&2
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$RELEASE_TITLE" \
+              --notes-file "$notes" \
+              --draft \
+              --prerelease \
+              --verify-tag
+          fi
+          echo "RELEASE_ALREADY_PUBLISHED=$release_already_published" >> "$GITHUB_ENV"
+      - name: Upload and independently verify draft assets
+        if: ${{ env.RELEASE_ALREADY_PUBLISHED != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" \
+            "$RELEASE_ASSETS/$ASSET_NAME" \
+            "$RELEASE_ASSETS/$ASSET_NAME.sha256" \
+            "$RELEASE_ASSETS/$METADATA_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+          draft_release="$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets,body,isDraft,isPrerelease,name,tagName)"
+          expected_body="$(cat "$RUNNER_TEMP/release-notes.md")"
+          actual_body="$(jq -r '.body // ""' <<<"$draft_release")"
+          test "$actual_body" = "$expected_body"
+          jq -e \
+            --arg asset "$ASSET_NAME" \
+            --arg checksum "$ASSET_NAME.sha256" \
+            --arg metadata "$METADATA_NAME" \
+            --arg tag "$RELEASE_TAG" \
+            --arg title "$RELEASE_TITLE" \
+            '.isDraft == true and .isPrerelease == true and .tagName == $tag and .name == $title and (.assets | length) == 3 and ([.assets[].name] | sort) == ([$asset, $checksum, $metadata] | sort) and all(.assets[]; .state == "uploaded")' \
+            <<<"$draft_release"
+          draft_assets="$RUNNER_TEMP/draft-assets"
+          mkdir -p "$draft_assets"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$draft_assets" \
+            --pattern "$ASSET_NAME" \
+            --pattern "$ASSET_NAME.sha256" \
+            --pattern "$METADATA_NAME"
+          test "$(find "$draft_assets" -maxdepth 1 -type f | wc -l)" -eq 3
+          cmp "$RELEASE_ASSETS/$ASSET_NAME" "$draft_assets/$ASSET_NAME"
+          cmp "$RELEASE_ASSETS/$ASSET_NAME.sha256" "$draft_assets/$ASSET_NAME.sha256"
+          cmp "$RELEASE_ASSETS/$METADATA_NAME" "$draft_assets/$METADATA_NAME"
+          (
+            cd "$draft_assets"
+            sha256sum --check --strict "$ASSET_NAME.sha256"
+          )
+          test "$(tar -tzf "$draft_assets/$ASSET_NAME")" = "flyctl"
+          gh attestation verify "$draft_assets/$ASSET_NAME" \
+            --repo "$GITHUB_REPOSITORY"
+      - name: Publish only the verified complete draft
+        if: ${{ env.RELEASE_ALREADY_PUBLISHED != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_SOURCE_SHA"
+          test "$GITHUB_SHA" = "$EXPECTED_SOURCE_SHA"
+          local_tag_oid="$(git rev-parse "$RELEASE_TAG")"
+          test -n "$EXPECTED_TAG_OID"
+          test "$local_tag_oid" = "$EXPECTED_TAG_OID"
+          mapfile -t remote_refs < <(
+            git ls-remote --tags origin \
+              "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}"
+          )
+          test "${#remote_refs[@]}" -eq 2
+          remote_tag_oid="$(printf '%s\n' "${remote_refs[@]}" |
+            awk '$2 !~ /\^\{\}$/ {print $1}')"
+          remote_peeled="$(printf '%s\n' "${remote_refs[@]}" |
+            awk '$2 ~ /\^\{\}$/ {print $1}')"
+          test "$remote_tag_oid" = "$local_tag_oid"
+          test "$remote_peeled" = "$GITHUB_SHA"
+          prepublish_release="$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets,body,isDraft,isPrerelease,name,tagName)"
+          expected_body="$(cat "$RUNNER_TEMP/release-notes.md")"
+          actual_body="$(jq -r '.body // ""' <<<"$prepublish_release")"
+          test "$actual_body" = "$expected_body"
+          jq -e \
+            --arg asset "$ASSET_NAME" \
+            --arg checksum "$ASSET_NAME.sha256" \
+            --arg metadata "$METADATA_NAME" \
+            --arg tag "$RELEASE_TAG" \
+            --arg title "$RELEASE_TITLE" \
+            '.isDraft == true and .isPrerelease == true and .tagName == $tag and .name == $title and (.assets | length) == 3 and ([.assets[].name] | sort) == ([$asset, $checksum, $metadata] | sort) and all(.assets[]; .state == "uploaded")' \
+            <<<"$prepublish_release"
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease \
+            --latest=false
+      - name: Verify the immutable published result
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_SOURCE_SHA"
+          test "$GITHUB_SHA" = "$EXPECTED_SOURCE_SHA"
+          local_tag_oid="$(git rev-parse "$RELEASE_TAG")"
+          test -n "$EXPECTED_TAG_OID"
+          test "$local_tag_oid" = "$EXPECTED_TAG_OID"
+          mapfile -t remote_refs < <(
+            git ls-remote --tags origin \
+              "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}"
+          )
+          test "${#remote_refs[@]}" -eq 2
+          remote_tag_oid="$(printf '%s\n' "${remote_refs[@]}" |
+            awk '$2 !~ /\^\{\}$/ {print $1}')"
+          remote_peeled="$(printf '%s\n' "${remote_refs[@]}" |
+            awk '$2 ~ /\^\{\}$/ {print $1}')"
+          test "$remote_tag_oid" = "$local_tag_oid"
+          test "$remote_peeled" = "$GITHUB_SHA"
+          published_release="$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets,body,isDraft,isPrerelease,name,tagName)"
+          expected_body="$(cat "$RUNNER_TEMP/release-notes.md")"
+          actual_body="$(jq -r '.body // ""' <<<"$published_release")"
+          test "$actual_body" = "$expected_body"
+          jq -e \
+            --arg asset "$ASSET_NAME" \
+            --arg checksum "$ASSET_NAME.sha256" \
+            --arg metadata "$METADATA_NAME" \
+            --arg tag "$RELEASE_TAG" \
+            --arg title "$RELEASE_TITLE" \
+            '.isDraft == false and .isPrerelease == true and .tagName == $tag and .name == $title and (.assets | length) == 3 and ([.assets[].name] | sort) == ([$asset, $checksum, $metadata] | sort) and all(.assets[]; .state == "uploaded")' \
+            <<<"$published_release"
+          final_assets="$RUNNER_TEMP/final-assets"
+          mkdir -p "$final_assets"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$final_assets" \
+            --pattern "$ASSET_NAME" \
+            --pattern "$ASSET_NAME.sha256" \
+            --pattern "$METADATA_NAME"
+          test "$(find "$final_assets" -maxdepth 1 -type f | wc -l)" -eq 3
+          cmp "$RELEASE_ASSETS/$ASSET_NAME" "$final_assets/$ASSET_NAME"
+          cmp "$RELEASE_ASSETS/$ASSET_NAME.sha256" "$final_assets/$ASSET_NAME.sha256"
+          cmp "$RELEASE_ASSETS/$METADATA_NAME" "$final_assets/$METADATA_NAME"
+          (
+            cd "$final_assets"
+            sha256sum --check --strict "$ASSET_NAME.sha256"
+          )
+          test "$(tar -tzf "$final_assets/$ASSET_NAME")" = "flyctl"
+          build_date="$(git show -s --format=%cI HEAD)"
+          jq -e \
+            --arg asset "$ASSET_NAME" \
+            --arg buildDate "$build_date" \
+            --arg fix "$FIX_COMMIT" \
+            --arg go "$GO_VERSION" \
+            --arg sha "$(awk '{print $1}' "$final_assets/$ASSET_NAME.sha256")" \
+            --arg source "$GITHUB_SHA" \
+            --arg tag "$RELEASE_TAG" \
+            --arg version "$RELEASE_VERSION" \
+            '.asset==$asset and .buildDate==$buildDate and .fixCommit==$fix and .goVersion==$go and .sha256==$sha and .sourceCommit==$source and .releaseTag==$tag and .releaseVersion==$version and (keys | sort) == (["asset","buildDate","fixCommit","goVersion","releaseTag","releaseVersion","sha256","sourceCommit"] | sort)' \
+            "$final_assets/$METADATA_NAME"
+          gh attestation verify "$final_assets/$ASSET_NAME" \
+            --repo "$GITHUB_REPOSITORY"
+          git diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
